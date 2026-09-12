@@ -60,9 +60,11 @@ import { SupabaseModal } from './components/SupabaseModal';
 import {
   fetchJournalsFromSupabase,
   fetchReflectionsFromSupabase,
+  fetchUsersFromSupabase,
   saveJournalToSupabase,
   saveStudentReflectionToSupabase,
   saveParentReflectionToSupabase,
+  saveSingleUserToSupabase,
   refreshSupabaseStatus,
   startAutomaticSynchronization,
 } from './lib/supabaseService';
@@ -269,17 +271,36 @@ export default function App() {
     const loadFromSupabase = async () => {
       try {
         await refreshSupabaseStatus();
-        const remoteJournals = await fetchJournalsFromSupabase();
-        if (isMounted && remoteJournals && remoteJournals.length > 0) {
-          setJournals(remoteJournals);
-        }
-        const remoteReflections = await fetchReflectionsFromSupabase();
-        if (isMounted && remoteReflections) {
-          if (remoteReflections.studentReflection) {
-            setStudentReflection(remoteReflections.studentReflection);
+        const [remoteJournals, remoteReflections, remoteUsers] = await Promise.all([
+          fetchJournalsFromSupabase(),
+          fetchReflectionsFromSupabase(),
+          fetchUsersFromSupabase(),
+        ]);
+        if (isMounted) {
+          if (remoteJournals && remoteJournals.length > 0) {
+            setJournals(remoteJournals);
           }
-          if (remoteReflections.parentReflection) {
-            setParentReflection(remoteReflections.parentReflection);
+          if (remoteReflections) {
+            if (remoteReflections.studentReflection) {
+              setStudentReflection(remoteReflections.studentReflection);
+            }
+            if (remoteReflections.parentReflection) {
+              setParentReflection(remoteReflections.parentReflection);
+            }
+          }
+          if (remoteUsers && remoteUsers.length > 0) {
+            try {
+              localStorage.setItem('si7kaih_users_pool_prod', JSON.stringify(remoteUsers));
+              window.dispatchEvent(new CustomEvent('si7kaih_users_updated', { detail: remoteUsers }));
+              setCurrentPersona((prev) => {
+                const match = remoteUsers.find((u) => u.id === prev.id || u.username === prev.username);
+                if (match && JSON.stringify(match) !== JSON.stringify(prev)) {
+                  localStorage.setItem('si7kaih_persona_prod', JSON.stringify(match));
+                  return match;
+                }
+                return prev;
+              });
+            } catch (_e) {}
           }
         }
       } catch (err) {
@@ -352,6 +373,39 @@ export default function App() {
           });
         }
       },
+      onUserUpdate: (updatedUser, source) => {
+        if (!isMounted) return;
+        setCurrentPersona((prev) => {
+          if (prev.id === updatedUser.id || prev.username === updatedUser.username) {
+            try {
+              localStorage.setItem('si7kaih_persona_prod', JSON.stringify(updatedUser));
+            } catch (_e) {}
+            return updatedUser;
+          }
+          return prev;
+        });
+
+        if (source === 'realtime' || source === 'broadcast') {
+          setSyncToast({
+            id: `toast-${Date.now()}`,
+            title: 'Data Pengguna Terperbarui',
+            detail: `Profil/akun ${updatedUser.name} (${updatedUser.role}) disinkronkan secara realtime.`,
+          });
+        }
+      },
+      onAllUsersSync: (remoteUsers) => {
+        if (!isMounted) return;
+        setCurrentPersona((prev) => {
+          const match = remoteUsers.find((u) => u.id === prev.id || u.username === prev.username);
+          if (match && JSON.stringify(match) !== JSON.stringify(prev)) {
+            try {
+              localStorage.setItem('si7kaih_persona_prod', JSON.stringify(match));
+            } catch (_e) {}
+            return match;
+          }
+          return prev;
+        });
+      },
       onNotification: (title, detail) => {
         if (!isMounted) return;
         setSyncToast({
@@ -367,6 +421,49 @@ export default function App() {
       stopAutoSync();
     };
   }, []);
+
+  // Ensure dashboard view is always freshly updated from server whenever accessed on any device
+  useEffect(() => {
+    if (viewMode === 'APP') {
+      fetchJournalsFromSupabase()
+        .then((remoteJournals) => {
+          if (remoteJournals && remoteJournals.length > 0) {
+            setJournals((prev) => {
+              const map = new Map<string, DailyJournal>();
+              prev.forEach((j) => map.set(`${j.studentId || 'default'}_${j.journalDate || j.id}`, j));
+              let changed = false;
+              remoteJournals.forEach((rj) => {
+                const key = `${rj.studentId || 'default'}_${rj.journalDate || rj.id}`;
+                const ex = map.get(key);
+                if (!ex || JSON.stringify(ex) !== JSON.stringify(rj)) {
+                  map.set(key, rj);
+                  changed = true;
+                }
+              });
+              return changed ? Array.from(map.values()) : prev;
+            });
+          }
+        })
+        .catch(() => {});
+
+      fetchUsersFromSupabase()
+        .then((remoteUsers) => {
+          if (remoteUsers && remoteUsers.length > 0) {
+            setCurrentPersona((prev) => {
+              const match = remoteUsers.find((u) => u.id === prev.id || u.username === prev.username);
+              if (match && JSON.stringify(match) !== JSON.stringify(prev)) {
+                try {
+                  localStorage.setItem('si7kaih_persona_prod', JSON.stringify(match));
+                } catch (_e) {}
+                return match;
+              }
+              return prev;
+            });
+          }
+        })
+        .catch(() => {});
+    }
+  }, [viewMode, activeTab, currentPersona.id]);
 
   // Today's journal - clean empty fallback when no entry exists
   const todayStr = useMemo(() => new Date().toISOString().split('T')[0], []);
@@ -524,6 +621,11 @@ export default function App() {
         saveStoredUsers(pool);
       }
     } catch (_e) {}
+
+    // Save user update to Supabase and broadcast across devices
+    saveSingleUserToSupabase(updated).catch((err) =>
+      console.warn('Supabase persona update error:', err)
+    );
   };
 
   // When switching personas, reset active tab to dashboard and restart session timer

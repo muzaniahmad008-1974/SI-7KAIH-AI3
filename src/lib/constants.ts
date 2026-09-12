@@ -135,6 +135,17 @@ export const saveStoredUsers = (users: UserPersona[]): void => {
     localStorage.setItem('si7kaih_users_pool_prod', JSON.stringify(users));
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('si7kaih_users_updated', { detail: users }));
+      if ('BroadcastChannel' in window) {
+        try {
+          const bc = new BroadcastChannel('si7kaih_sync_channel');
+          bc.postMessage({
+            type: 'USERS_SAVED',
+            users,
+            timestamp: Date.now(),
+          });
+          bc.close();
+        } catch (_e) {}
+      }
     }
   } catch (_e) {}
 };

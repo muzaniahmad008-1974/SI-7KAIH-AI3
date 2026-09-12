@@ -43,6 +43,7 @@ import { UserPersona, getStoredUsers, USER_PERSONAS } from '../lib/constants';
 import { Student, Rombel, getStoredStudents, getStoredRombels } from '../lib/studentData';
 import { SchoolMaster, getStoredSchools } from '../lib/schoolMasterData';
 import { DailyJournal } from '../../packages/types/src/index';
+import { fetchUsersFromSupabase, fetchJournalsFromSupabase } from '../lib/supabaseService';
 
 interface LoginDashboardProps {
   onLoginSuccess: (persona: UserPersona) => void;
@@ -122,6 +123,25 @@ export const LoginDashboard: React.FC<LoginDashboardProps> = ({ onLoginSuccess }
       setUsers(getStoredUsers());
       const savedJournals = localStorage.getItem('si7kaih_journals_prod');
       setJournals(savedJournals ? JSON.parse(savedJournals) : []);
+
+      // Pull latest authoritative users & journals from Supabase backend on access
+      fetchUsersFromSupabase()
+        .then((remoteUsers) => {
+          if (remoteUsers && remoteUsers.length > 0) {
+            setUsers(remoteUsers);
+            localStorage.setItem('si7kaih_users_pool_prod', JSON.stringify(remoteUsers));
+          }
+        })
+        .catch(() => {});
+
+      fetchJournalsFromSupabase()
+        .then((remoteJournals) => {
+          if (remoteJournals && remoteJournals.length > 0) {
+            setJournals(remoteJournals);
+            localStorage.setItem('si7kaih_journals_prod', JSON.stringify(remoteJournals));
+          }
+        })
+        .catch(() => {});
     } catch (_e) {}
   };
 

@@ -350,11 +350,79 @@ export async function saveUsersToSupabase(users: UserPersona[]): Promise<boolean
     }));
 
     const { error } = await supabase.from('si7kaih_users').upsert(rows, { onConflict: 'id' });
+    if (!error) {
+      currentStatus.lastSyncedAt = new Date().toISOString();
+      currentStatus.syncCount++;
+      currentStatus.lastSyncEvent = `Penyimpanan ${users.length} akun pengguna ke Supabase`;
+      notifyListeners();
+
+      if (broadcastChannel) {
+        try {
+          broadcastChannel.postMessage({
+            type: 'USERS_SAVED',
+            users,
+            timestamp: Date.now(),
+          });
+        } catch (_e) {}
+      }
+    }
     return !error;
   } catch (err) {
     console.warn('Error saving users to Supabase:', err);
     return false;
   }
+}
+
+export async function saveSingleUserToSupabase(user: UserPersona): Promise<boolean> {
+  try {
+    const row = {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+      school_id: user.schoolId || null,
+      data: user,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase.from('si7kaih_users').upsert(row, { onConflict: 'id' });
+    if (!error) {
+      currentStatus.lastSyncedAt = new Date().toISOString();
+      currentStatus.syncCount++;
+      currentStatus.lastSyncEvent = `Penyimpanan akun pengguna ${user.name} (${user.role})`;
+      notifyListeners();
+
+      if (broadcastChannel) {
+        try {
+          broadcastChannel.postMessage({
+            type: 'SINGLE_USER_SAVED',
+            user,
+            timestamp: Date.now(),
+          });
+        } catch (_e) {}
+      }
+    }
+    return !error;
+  } catch (err) {
+    console.warn('Error saving single user to Supabase:', err);
+    return false;
+  }
+}
+
+// Global auto-sync listener for user pool modifications across the app
+if (typeof window !== 'undefined') {
+  let saveUsersDebounceTimer: any = null;
+  window.addEventListener('si7kaih_users_updated', (e: any) => {
+    const users = e.detail;
+    if (Array.isArray(users) && users.length > 0) {
+      if (saveUsersDebounceTimer) clearTimeout(saveUsersDebounceTimer);
+      saveUsersDebounceTimer = setTimeout(() => {
+        saveUsersToSupabase(users).catch((err) => {
+          console.warn('Background auto-sync users to Supabase notice:', err);
+        });
+      }, 500);
+    }
+  });
 }
 
 // ----------------------------------------------------------------------------
@@ -460,6 +528,8 @@ export interface AutoSyncCallbacks {
     reflection: StudentMonthlyReflection | ParentMonthlyReflection,
     source: 'realtime' | 'poll' | 'broadcast'
   ) => void;
+  onUserUpdate?: (user: UserPersona, source: 'realtime' | 'poll' | 'broadcast') => void;
+  onAllUsersSync?: (users: UserPersona[], source: 'realtime' | 'poll' | 'broadcast') => void;
   onNotification?: (message: string, detail?: string) => void;
 }
 
@@ -510,6 +580,40 @@ export function startAutomaticSynchronization(callbacks: AutoSyncCallbacks): () 
           }
         }
       )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'si7kaih_users' },
+        (payload: any) => {
+          if (isCleanedUp) return;
+          if (payload.new && payload.new.data) {
+            const updatedUser = payload.new.data as UserPersona;
+            try {
+              const raw = localStorage.getItem('si7kaih_users_pool_prod');
+              const pool: UserPersona[] = raw ? JSON.parse(raw) : [];
+              const idx = pool.findIndex((u) => u.id === updatedUser.id);
+              if (idx >= 0) {
+                pool[idx] = updatedUser;
+              } else {
+                pool.push(updatedUser);
+              }
+              localStorage.setItem('si7kaih_users_pool_prod', JSON.stringify(pool));
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent('si7kaih_users_updated', { detail: pool }));
+              }
+            } catch (_e) {}
+
+            callbacks.onUserUpdate?.(updatedUser, 'realtime');
+            currentStatus.syncCount++;
+            currentStatus.lastSyncedAt = new Date().toISOString();
+            currentStatus.lastSyncEvent = `Pembaruan realtime profil ${updatedUser.name} (${updatedUser.role})`;
+            notifyListeners();
+            callbacks.onNotification?.(
+              'Profil/Akun Terperbarui',
+              `Data akun ${updatedUser.name} (${updatedUser.role}) telah terupdate di semua perangkat.`
+            );
+          }
+        }
+      )
       .subscribe((status: string) => {
         if (!isCleanedUp) {
           currentStatus.isRealtimeActive = status === 'SUBSCRIBED';
@@ -540,39 +644,109 @@ export function startAutomaticSynchronization(callbacks: AutoSyncCallbacks): () 
       currentStatus.lastSyncedAt = new Date().toISOString();
       notifyListeners();
     }
+    if (event.data.type === 'SINGLE_USER_SAVED' && event.data.user) {
+      const updatedUser = event.data.user as UserPersona;
+      try {
+        const raw = localStorage.getItem('si7kaih_users_pool_prod');
+        const pool: UserPersona[] = raw ? JSON.parse(raw) : [];
+        const idx = pool.findIndex((u) => u.id === updatedUser.id);
+        if (idx >= 0) {
+          pool[idx] = updatedUser;
+        } else {
+          pool.push(updatedUser);
+        }
+        localStorage.setItem('si7kaih_users_pool_prod', JSON.stringify(pool));
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('si7kaih_users_updated', { detail: pool }));
+        }
+      } catch (_e) {}
+      callbacks.onUserUpdate?.(updatedUser, 'broadcast');
+      currentStatus.syncCount++;
+      currentStatus.lastSyncedAt = new Date().toISOString();
+      notifyListeners();
+    }
+    if (event.data.type === 'USERS_SAVED' && Array.isArray(event.data.users)) {
+      callbacks.onAllUsersSync?.(event.data.users, 'broadcast');
+      currentStatus.syncCount++;
+      currentStatus.lastSyncedAt = new Date().toISOString();
+      notifyListeners();
+    }
   };
 
   if (broadcastChannel) {
     broadcastChannel.addEventListener('message', handleBroadcastMessage);
   }
 
-  // C. Background Periodic Polling (Fallback for network blips or offline recovery)
-  const pollInterval = setInterval(async () => {
-    if (isCleanedUp || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+  // C. Unified remote sync runner for background polling and user access events
+  const syncAllRemoteData = async () => {
+    if (isCleanedUp) return;
     try {
-      const latest = await fetchJournalsFromSupabase();
-      if (latest && latest.length > 0 && !isCleanedUp) {
-        callbacks.onAllJournalsSync?.(latest);
+      // 1. Fetch latest journals
+      const remoteJournals = await fetchJournalsFromSupabase();
+      if (remoteJournals && remoteJournals.length > 0 && !isCleanedUp) {
+        callbacks.onAllJournalsSync?.(remoteJournals);
+      }
+
+      // 2. Fetch latest users
+      const remoteUsers = await fetchUsersFromSupabase();
+      if (remoteUsers && remoteUsers.length > 0 && !isCleanedUp) {
+        try {
+          const raw = localStorage.getItem('si7kaih_users_pool_prod');
+          const localPool: UserPersona[] = raw ? JSON.parse(raw) : [];
+          const userMap = new Map<string, UserPersona>();
+          localPool.forEach((u) => userMap.set(u.id, u));
+          let hasDiff = false;
+          remoteUsers.forEach((ru) => {
+            const ex = userMap.get(ru.id);
+            if (!ex || JSON.stringify(ex) !== JSON.stringify(ru)) {
+              userMap.set(ru.id, ru);
+              hasDiff = true;
+            }
+          });
+          if (hasDiff) {
+            const merged = Array.from(userMap.values());
+            localStorage.setItem('si7kaih_users_pool_prod', JSON.stringify(merged));
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('si7kaih_users_updated', { detail: merged }));
+            }
+            callbacks.onAllUsersSync?.(merged, 'poll');
+          }
+        } catch (_e) {
+          callbacks.onAllUsersSync?.(remoteUsers, 'poll');
+        }
+      }
+
+      // 3. Fetch latest reflections
+      const remoteReflections = await fetchReflectionsFromSupabase();
+      if (remoteReflections && !isCleanedUp) {
+        if (remoteReflections.studentReflection) {
+          callbacks.onReflectionUpdate?.('STUDENT', remoteReflections.studentReflection, 'poll');
+        }
+        if (remoteReflections.parentReflection) {
+          callbacks.onReflectionUpdate?.('PARENT', remoteReflections.parentReflection, 'poll');
+        }
       }
     } catch (_e) {
       // Quiet background check
     }
-  }, 12000);
+  };
 
-  // D. Immediate sync when user switches tab or brings window into focus
-  const handleVisibilityOrFocus = async () => {
+  // Run periodic polling every 10 seconds when tab is visible
+  const pollInterval = setInterval(() => {
+    if (isCleanedUp || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+    syncAllRemoteData();
+  }, 10000);
+
+  // Immediate sync whenever user accesses tab, switches back to app, or regains network
+  const handleVisibilityOrFocus = () => {
     if (typeof document !== 'undefined' && document.visibilityState === 'visible' && !isCleanedUp) {
-      try {
-        const latest = await fetchJournalsFromSupabase();
-        if (latest && latest.length > 0 && !isCleanedUp) {
-          callbacks.onAllJournalsSync?.(latest);
-        }
-      } catch (_e) {}
+      syncAllRemoteData();
     }
   };
 
   if (typeof window !== 'undefined') {
     window.addEventListener('focus', handleVisibilityOrFocus);
+    window.addEventListener('online', handleVisibilityOrFocus);
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibilityOrFocus);
     }
@@ -587,6 +761,7 @@ export function startAutomaticSynchronization(callbacks: AutoSyncCallbacks): () 
     }
     if (typeof window !== 'undefined') {
       window.removeEventListener('focus', handleVisibilityOrFocus);
+      window.removeEventListener('online', handleVisibilityOrFocus);
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
       }
